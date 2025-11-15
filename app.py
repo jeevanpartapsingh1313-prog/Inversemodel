@@ -1,12 +1,13 @@
 import os
 import tempfile
-from datetime import datetime   # NEW: for logging questions
+from datetime import datetime
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import requests
 
 from scipy.signal import butter, filtfilt
 from scipy.fft import rfft, rfftfreq
@@ -15,174 +16,143 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 
-from openai import OpenAI
-
-
-# ==========================
-#   FEATURE EXPLANATIONS
-# ==========================
 
 FEATURE_HELP = {
-    "mode": (
-        "Modes change how information is shown:\n"
-        "- Clinician: compact view with key numbers (CBF, regularity, amplitude).\n"
-        "- Student: more text and step-by-step explanations.\n"
-        "- Researcher: shows raw feature table and the full classification report.\n"
-        "- Tour: guided explanation of what each part of the app does."
-    ),
-    "cilia_bot": (
-        "CiliaBot is a small chatbot that explains PCD, motile cilia, CBF, CBP and what "
-        "the graphs mean in simple language. It is for education only and does NOT give "
-        "medical advice or diagnosis."
-    ),
-    "cbf": (
-        "CBF (Ciliary Beat Frequency) is how many times per second the cilia beat. "
-        "For example, 10 Hz means about 10 beats each second. In this app, CBF is "
-        "estimated from brightness changes in the video using a band-pass filter and the FFT."
-    ),
-    "cbp_score": (
-        "The CBP (ciliary beating pattern) sine score is a rough measure of how regular "
-        "the motion is. A value near 1 means the motion looks like a clean, smooth sine "
-        "wave. Values nearer 0 mean more irregular or noisy beating."
-    ),
-    "cbp_amp": (
-        "The CBP amplitude is the size of the oscillation in the filtered signal. "
-        "A larger amplitude means stronger brightness changes over time, which usually "
-        "corresponds to stronger or larger-range beating."
-    ),
-    "zcr": (
-        "ZCR (zero-crossing rate) counts how often the signal crosses zero. "
-        "If the signal crosses zero very often, it may indicate faster or more jittery "
-        "changes. Here it is just one simple feature among many."
-    ),
-    "var": (
-        "Variance measures how spread out the filtered signal values are. Higher variance "
-        "means the motion signal has larger changes in intensity over time."
-    ),
-    "prediction": (
-        "The Random Forest classifier looks at several global features (CBF, variance, "
-        "zero-crossing rate, regularity score, amplitude) and compares them to labelled "
-        "training examples. It then assigns a label such as 'Healthy-like' or 'PCD-like'. "
-        "This is a research / teaching demo only, not a diagnostic tool."
-    ),
-    "signals": (
-        "The raw signal is the average brightness of each frame over time. This tells us "
-        "how the overall intensity changes during the video. The filtered signal keeps "
-        "only frequencies in a chosen band (for example 2–30 Hz) so we can focus on the "
-        "cilia beating and remove slow drifts or very fast noise."
-    ),
-    "fft": (
-        "The FFT (Fast Fourier Transform) converts the time-based signal into frequency "
-        "space. Peaks in the FFT show which beat frequencies dominate the motion. The "
-        "highest peak inside a chosen range (for example 2–30 Hz) is used as the estimated CBF."
-    ),
-    "sim_sliders": (
-        "The simulation sliders let you play with a synthetic cilia signal:\n"
-        "- CBF: how fast the cilia beat (Hz).\n"
-        "- Regularity: 1 = smooth, periodic motion; 0 = very irregular.\n"
-        "- Amplitude: overall strength of the oscillation.\n"
-        "- Duration: how long the simulated signal lasts.\n"
-        "This is not real patient data, just a teaching tool."
-    ),
-    "sim_cilium": (
-        "The toy cilium view shows a single line that tilts according to the simulated "
-        "signal at one moment in time. It gives an intuitive feel of how changes in the "
-        "signal would look as a physical cilium moving."
-    ),
-    "multi_cilia": (
-        "The multi-cilia visualizer draws many simple sine waves with different random "
-        "phases. This is a cartoon-style sketch of a field of cilia beating together "
-        "at a chosen frequency. It helps build intuition about synchronous vs slightly "
-        "out-of-phase beating; it is not real data."
-    ),
+    "cbf": {
+        "Student": (
+            "CBF means Ciliary Beat Frequency. It tells you how many times the cilia beat "
+            "every second. We estimate this from the brightness pattern and find the strongest "
+            "repeating wave using the FFT."
+        ),
+        "Clinician": (
+            "Ciliary Beat Frequency is computed by band-pass filtering the mean pixel-intensity "
+            "trace (2–30 Hz) and identifying the dominant spectral peak in the FFT magnitude. "
+            "It approximates the primary ciliary stroke frequency after removing low-frequency "
+            "drift and high-frequency noise."
+        ),
+    },
+    "cbp_score": {
+        "Student": (
+            "This regularity score tells you how smooth and sine-like the motion is. Values near 1 "
+            "mean very regular beating; lower values mean more irregular motion."
+        ),
+        "Clinician": (
+            "The CBP regularity score is the normalized correlation between the filtered trace and "
+            "an ideal sinusoid at the dominant frequency. Low scores suggest dyskinetic or "
+            "asynchronous beating patterns typical of PCD."
+        ),
+    },
+    "cbp_amp": {
+        "Student": (
+            "Amplitude shows how strong the cilia movement is. Higher values mean the signal has "
+            "bigger swings; lower values mean weaker motion."
+        ),
+        "Clinician": (
+            "CBP amplitude is approximated by the standard deviation of the band-passed signal. "
+            "It reflects stroke displacement magnitude; reduced amplitude is associated with "
+            "hypokinetic or nearly static cilia."
+        ),
+    },
+    "zcr": {
+        "Student": (
+            "Zero-crossing rate counts how often the signal crosses zero. A higher rate can mean "
+            "faster or more jittery changes."
+        ),
+        "Clinician": (
+            "Zero-crossing rate is a simple descriptor of oscillatory irregularity. Very high values "
+            "can indicate noisy or fragmented motion rather than a clean periodic beat."
+        ),
+    },
+    "var": {
+        "Student": (
+            "Variance tells you how much the signal values change over time. Bigger variance means "
+            "larger ups and downs; small variance means the signal stays flatter."
+        ),
+        "Clinician": (
+            "Variance of the filtered trace reflects total oscillatory energy. Very low variance can "
+            "indicate near-static cilia; high variance reflects strong, sustained motion."
+        ),
+    },
+    "signals": {
+        "Student": (
+            "The raw signal is the average brightness of each frame. The filtered signal removes slow "
+            "drifts and noise so you can see a cleaner repeating wave from the cilia motion."
+        ),
+        "Clinician": (
+            "The raw signal is the frame-wise mean grayscale intensity. After applying a Butterworth "
+            "band-pass filter (2–30 Hz), the filtered trace highlights physiologic ciliary motion by "
+            "suppressing low-frequency camera drift and high-frequency noise."
+        ),
+    },
+    "fft": {
+        "Student": (
+            "The FFT plot shows which frequencies are strong in the motion signal. The tallest peak is "
+            "usually the main beat frequency of the cilia."
+        ),
+        "Clinician": (
+            "The FFT magnitude spectrum is computed using the real-valued rFFT. Peaks in the expected "
+            "physiologic range correspond to dominant beating frequencies, while broadened or weak peaks "
+            "can indicate dyskinetic motion or poor signal quality."
+        ),
+    },
+    "sim_sliders": {
+        "Student": (
+            "These controls let you play with a fake cilia signal. You can change how fast it beats, how "
+            "regular it is, how strong the movement is, and how long it runs."
+        ),
+        "Clinician": (
+            "The simulation exposes controllable parameters for synthetic oscillatory signals: frequency, "
+            "regularity via noise and envelope modulation, amplitude, and duration. It is intended for "
+            "intuition-building, not biophysical modelling."
+        ),
+    },
+    "sim_cilium": {
+        "Student": (
+            "This view draws a simple line that tilts according to the signal value, like a cartoon cilium "
+            "moving back and forth."
+        ),
+        "Clinician": (
+            "The toy cilium view maps a normalized signal sample to an angular displacement. It is a didactic "
+            "visual and does not model full 3D axonemal mechanics."
+        ),
+    },
+    "prediction": {
+        "Student": (
+            "The model looks at the numbers above and guesses whether the motion looks more like healthy cilia "
+            "or PCD-like cilia. It is only for learning, not diagnosis."
+        ),
+        "Clinician": (
+            "The Random Forest operates on six global features to assign labels such as Healthy-like or PCD-like. "
+            "This is a research and teaching prototype and is not validated for clinical decision-making."
+        ),
+    },
+    "cilia_bot": {
+        "Student": (
+            "CiliaBot is a chat assistant that explains PCD, motile cilia, CBF, CBP and what the graphs mean in "
+            "simple language. It is only for education, not for medical advice."
+        ),
+        "Clinician": (
+            "CiliaBot uses a large language model to provide educational explanations about ciliary physiology, "
+            "PCD, and this app. It does not provide diagnostic guidance or replace clinical judgement."
+        ),
+    },
 }
 
 
-# ==========================
-#   TOUR STEPS
-# ==========================
-
-TOUR_STEPS = [
-    {
-        "title": "Overview of the app",
-        "body": (
-            "This app has three main pieces:\n"
-            "1. Analyse video: upload a cilia video and extract features like CBF and CBP.\n"
-            "2. Simulation lab: play with a synthetic cilia signal to build intuition.\n"
-            "3. Multi-cilia visualizer: see a cartoon of many cilia beating with a chosen CBF.\n\n"
-            "Use this tour to read what each part does, then try it yourself."
-        ),
-    },
-    {
-        "title": "Uploading a video",
-        "body": (
-            "Go to the 'Analyse video' tab. Upload a short high-speed cilia video. "
-            "The app converts the frames to grayscale, computes the mean brightness per frame, "
-            "and treats that as a 1D signal. This is what all feature calculations are based on."
-        ),
-    },
-    {
-        "title": "Key global features",
-        "body": (
-            "After uploading, you see global features:\n"
-            "- CBF (Hz): estimated dominant beat frequency.\n"
-            "- Regularity score: how sine-like the motion looks.\n"
-            "- Amplitude: how strong the oscillations are.\n"
-            "- Variance and zero-crossing rate: additional signal statistics.\n\n"
-            "In Student mode you see these in a table; in Clinician mode they are shown as metrics."
-        ),
-    },
-    {
-        "title": "Model prediction",
-        "body": (
-            "The Random Forest classifier takes the global features and compares them to a small "
-            "labelled dataset. It outputs categories like 'Healthy-like' or 'PCD-like'. "
-            "This is only an educational demo; it is not a clinical tool."
-        ),
-    },
-    {
-        "title": "Signals and FFT",
-        "body": (
-            "Below the prediction, you can see plots of:\n"
-            "- Raw signal: mean brightness per frame.\n"
-            "- Filtered signal: band-pass filtered between 2–30 Hz.\n"
-            "You can also tick the FFT checkbox to see which frequencies dominate. "
-            "The highest peak in the chosen band is used as the CBF estimate."
-        ),
-    },
-    {
-        "title": "Simulation lab",
-        "body": (
-            "In the 'Simulation lab' tab, you can simulate a 1D cilia motion signal by setting:\n"
-            "- CBF, regularity, amplitude, and duration.\n"
-            "The plot shows how the signal changes over time, and the toy cilium view turns that "
-            "signal into a simple rotating line. This builds intuition for how signals map to motion."
-        ),
-    },
-    {
-        "title": "Multi-cilia visualizer",
-        "body": (
-            "In the 'Multi-cilia visualizer' tab, you can adjust the number of cilia and a common CBF. "
-            "The plot shows many simple waveforms stacked vertically with random phase shifts, which "
-            "is a cartoon of a field of beating cilia. It helps students imagine synchrony vs small phase shifts."
-        ),
-    },
-]
-
-
-# ==========================
-#   SMALL HELPERS
-# ==========================
-
-def explain_button(key: str, label: str = "Explain this"):
-    """Show an 'Explain this' button and an info box when clicked."""
-    if st.button(label, key=f"explain_{key}"):
-        st.info(FEATURE_HELP.get(key, "No explanation available for this item yet."))
+def explain_button(widget_key: str, label: str = "Explain", feature_key: str = None, mode: str = None):
+    if st.button(label, key=f"explain_{widget_key}"):
+        key = feature_key or widget_key
+        info = FEATURE_HELP.get(key)
+        if isinstance(info, dict) and mode is not None:
+            st.info(info.get(mode, "No explanation available for this mode."))
+        elif isinstance(info, str):
+            st.info(info)
+        else:
+            st.info("No explanation available for this item.")
 
 
 def log_ciliabot_question(question: str, mode: str):
-    """Log CiliaBot questions to a local CSV file so you can inspect them later."""
-    question = question.strip()
+    question = (question or "").strip()
     if not question:
         return
 
@@ -200,41 +170,58 @@ def log_ciliabot_question(question: str, mode: str):
         row.to_csv(log_path, mode="w", header=True, index=False)
 
 
-# ==========================
-#   GPT Chatbot
-# ==========================
+def ask_gpt(chat_history):
+    api_key = None
+    if "openrouter_api_key" in st.secrets:
+        api_key = st.secrets["openrouter_api_key"]
+    if not api_key:
+        api_key = os.getenv("OPENROUTER_API_KEY")
 
-def ask_gpt(question: str) -> str:
-    """GPT-powered CiliaBot (no medical advice)."""
-    if "openai" not in st.secrets or "api_key" not in st.secrets["openai"]:
-        return "⚠️ OpenAI API key is not configured. CiliaBot is disabled."
+    if not api_key:
+        return "⚠️ Missing OpenRouter API key."
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are CiliaBot, a friendly explainer for clinicians and students. "
+                "Explain primary ciliary dyskinesia (PCD), motile cilia, ciliary beat frequency (CBF), "
+                "ciliary beat pattern (CBP), and this app's features in clear, accurate language. "
+                "You provide education only and never medical advice or diagnosis."
+            ),
+        }
+    ] + chat_history
 
     try:
-        client = OpenAI(api_key=st.secrets["openai"]["api_key"])
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are CiliaBot, a friendly explainer for clinicians and students. "
-                        "Explain PCD, motile cilia, CBF, CBP, and the features of this app in "
-                        "simple, accurate language. Always say this is for education only and "
-                        "not medical advice or diagnosis."
-                    ),
-                },
-                {"role": "user", "content": question},
-            ],
-            max_tokens=250,
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost",
+                "X-Title": "CiliaMotionApp",
+            },
+            json={
+                "model": "meta-llama/llama-3.1-8b-instruct",
+                "messages": messages,
+                "max_tokens": 400,
+            },
+            timeout=30,
         )
-        return resp.choices[0].message.content
+        data = resp.json()
+
+        if "error" in data:
+            msg = data["error"].get("message", str(data["error"]))
+            return f"⚠️ OpenRouter API error: {msg}"
+
+        choices = data.get("choices")
+        if not choices:
+            return f"⚠️ Unexpected OpenRouter response: {data}"
+
+        return choices[0]["message"]["content"]
     except Exception as e:
-        return f"⚠️ Error contacting OpenAI: {e}"
+        return f"⚠️ Error contacting OpenRouter: {e}"
 
-
-# ==========================
-#   Signal processing
-# ==========================
 
 def bandpass_filter(signal, fs, low=2.0, high=30.0, order=2):
     nyq = 0.5 * fs
@@ -293,31 +280,27 @@ def compute_global_features(frames, fps):
     cbf, amp, filtered = fft_peak_features(mean_signal, fps, fmin=2.0, fmax=30.0)
     zcr = float(np.mean(np.diff(np.sign(filtered)) != 0))
     var = float(np.var(filtered))
-    cbp_score = cbp_sine_score(filtered, fps, cbf)
-    cbp_amp = float(np.std(filtered))
+    cbp_score_val = cbp_sine_score(filtered, fps, cbf)
+    cbp_amp_val = float(np.std(filtered))
 
     return {
         "global_cbf_hz": cbf,
         "global_peak_amp": amp,
         "global_var": var,
         "global_zcr": zcr,
-        "global_cbp_sine_score": cbp_score,
-        "global_cbp_amp": cbp_amp,
+        "global_cbp_sine_score": cbp_score_val,
+        "global_cbp_amp": cbp_amp_val,
         "raw_signal": mean_signal,
         "filtered_signal": filtered,
     }
 
-
-# ==========================
-#   Video helpers
-# ==========================
 
 def load_frames_from_file(path, max_frames=300):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     frames = []
     count = 0
 
@@ -338,6 +321,8 @@ def load_frames_from_file(path, max_frames=300):
         raise RuntimeError("No frames read from video.")
 
     frames = np.stack(frames, axis=0)
+    if fps <= 0:
+        fps = 60.0
     return frames, fps
 
 
@@ -350,10 +335,6 @@ def extract_features_from_uploaded_video(uploaded_file, max_frames=300):
     feats = compute_global_features(frames, fps)
     return feats, fps, frames.shape[0]
 
-
-# ==========================
-#   Simulation helpers
-# ==========================
 
 def simulate_cilia_signal(cbf_hz, duration_sec, fps, regularity, amplitude):
     n = int(duration_sec * fps)
@@ -386,10 +367,6 @@ def draw_cilium_frame(value, max_angle_deg=40):
     ax.set_title(f"Cilium angle: {angle:.1f}°")
     return fig
 
-
-# ==========================
-#   Model training
-# ==========================
 
 @st.cache_data
 def load_training_data(csv_path="labeled_cilia_video_dataset.csv"):
@@ -439,32 +416,51 @@ def train_model(csv_path="labeled_cilia_video_dataset.csv"):
     return model, feat_cols, acc, report_text
 
 
-# ==========================
-#   Main UI
-# ==========================
+@st.cache_data
+def load_healthy_baseline(csv_path="labeled_cilia_video_dataset.csv", feat_cols=None):
+    df = load_training_data(csv_path)
+
+    if feat_cols is None:
+        feat_cols = [
+            "global_cbf_hz",
+            "global_peak_amp",
+            "global_var",
+            "global_zcr",
+            "global_cbp_sine_score",
+            "global_cbp_amp",
+        ]
+
+    df_clean = df.dropna(subset=feat_cols + ["class"])
+    healthy = df_clean[df_clean["class"] == "Healthy"]
+
+    if healthy.empty:
+        return None
+
+    mean = healthy[feat_cols].mean()
+    std = healthy[feat_cols].std()
+
+    baseline = pd.DataFrame(
+        {
+            "feature": feat_cols,
+            "Healthy mean": mean.values,
+            "Healthy low (mean-1σ)": (mean - std).values,
+            "Healthy high (mean+1σ)": (mean + std).values,
+        }
+    )
+
+    return baseline
+
 
 def main():
     st.set_page_config(page_title="Cilia Motion Classifier Pro", layout="wide")
     st.title("🧬 Cilia Motion Classifier & Simulation Lab")
 
-    # Sidebar: modes + chatbot + glossary
     st.sidebar.title("Modes")
     mode = st.sidebar.radio(
         "Choose mode:",
-        ["Clinician", "Student", "Researcher", "Tour"],
+        ["Clinician", "Student"],
         index=1,
     )
-    explain_button("mode", "Explain modes")
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("CiliaBot (educational only)")
-    explain_button("cilia_bot", "What is CiliaBot?")
-    user_q = st.sidebar.text_input("Ask about PCD / CBF / CBP / this app:")
-    if user_q.strip():
-        answer = ask_gpt(user_q)
-        st.sidebar.write(answer)
-        st.sidebar.caption("CiliaBot is for education only, not medical advice.")
-        log_ciliabot_question(user_q, mode)
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Feature glossary")
@@ -481,7 +477,7 @@ def main():
             "FFT",
             "Simulation sliders",
             "Toy cilium view",
-            "Multi-cilia visualizer",
+            "CiliaBot",
         ],
     )
 
@@ -496,61 +492,33 @@ def main():
         "FFT": "fft",
         "Simulation sliders": "sim_sliders",
         "Toy cilium view": "sim_cilium",
-        "Multi-cilia visualizer": "multi_cilia",
+        "CiliaBot": "cilia_bot",
     }
-    st.sidebar.info(FEATURE_HELP[glossary_map[feature_choice]])
+    gkey = glossary_map[feature_choice]
+    ginfo = FEATURE_HELP.get(gkey)
+    if isinstance(ginfo, dict):
+        st.sidebar.info(ginfo.get(mode, "No explanation available for this mode."))
+    elif isinstance(ginfo, str):
+        st.sidebar.info(ginfo)
+    else:
+        st.sidebar.info("No explanation available.")
 
-    # Guided tour state
-    if "tour_step" not in st.session_state:
-        st.session_state.tour_step = 0
-
-    if mode == "Tour":
-        step = st.session_state.tour_step
-        st.markdown("### Guided tour")
-        st.write(
-            f"Step {step+1} of {len(TOUR_STEPS)}: **{TOUR_STEPS[step]['title']}**"
-        )
-        st.info(TOUR_STEPS[step]["body"])
-
-        col_prev, col_next = st.columns(2)
-        with col_prev:
-            if st.button("Previous step", disabled=(step == 0)):
-                st.session_state.tour_step = max(0, step - 1)
-                st.experimental_rerun()
-        with col_next:
-            if st.button("Next step", disabled=(step == len(TOUR_STEPS) - 1)):
-                st.session_state.tour_step = min(len(TOUR_STEPS) - 1, step + 1)
-                st.experimental_rerun()
-
-    # Train model
     try:
         model, feat_cols, acc, report_txt = train_model("labeled_cilia_video_dataset.csv")
-        st.success(f"Random Forest trained. Test accuracy: **{acc*100:.1f}%**")
+        st.success(f"Random Forest trained. Test accuracy: {acc*100:.1f}%")
     except Exception as e:
         st.error(f"Could not train model: {e}")
         return
 
-    if mode == "Researcher":
-        with st.expander("Show training classification report"):
-            st.text(report_txt)
+    healthy_baseline = load_healthy_baseline("labeled_cilia_video_dataset.csv", feat_cols)
 
-        with st.expander("View CiliaBot question log (local)"):
-            log_path = "cilia_bot_log.csv"
-            if os.path.exists(log_path):
-                log_df = pd.read_csv(log_path)
-                st.dataframe(log_df.tail(100))
-            else:
-                st.write("No CiliaBot questions have been logged yet in this environment.")
-
-    # Tabs
-    tab_analyse, tab_sim, tab_multi = st.tabs(
-        ["Analyse video", "Simulation lab", "Multi-cilia visualizer"]
+    tab_analyse, tab_sim, tab_chat = st.tabs(
+        ["Analyse video", "Simulation lab", "Ask CiliaBot"]
     )
 
-    # ---------------- Tab: Analyse video ----------------
     with tab_analyse:
         st.subheader("Upload a cilia video")
-        explain_button("signals", "Explain what we analyse")
+        explain_button("video_upload", "Explain what we analyse", feature_key="signals", mode=mode)
 
         uploaded_video = st.file_uploader(
             "Upload a video file (.avi, .mp4, .mov)", type=["avi", "mp4", "mov"]
@@ -576,9 +544,8 @@ def main():
                     st.error(f"Error reading or processing video: {e}")
                     return
 
-            st.write(f"**Video info:** {n_frames} frames at {fps:.1f} fps")
+            st.write(f"Video info: {n_frames} frames at {fps:.1f} fps")
 
-            # Prepare scalar features for display
             feats_for_display = {
                 k: v for k, v in feats.items()
                 if k not in ["raw_signal", "filtered_signal"]
@@ -594,24 +561,53 @@ def main():
                 col3.metric(
                     "Amplitude", f"{feats_for_display['global_cbp_amp']:.3f}"
                 )
-                explain_button("cbf", "Explain CBF")
-                explain_button("cbp_score", "Explain regularity score")
-                explain_button("cbp_amp", "Explain amplitude")
+                explain_button("cbf_metrics", "Explain CBF", feature_key="cbf", mode=mode)
+                explain_button("cbp_score_metrics", "Explain regularity", feature_key="cbp_score", mode=mode)
+                explain_button("cbp_amp_metrics", "Explain amplitude", feature_key="cbp_amp", mode=mode)
 
-            elif mode in ["Student", "Tour"]:
+            elif mode == "Student":
                 st.markdown("### Extracted global features")
                 st.table(pd.DataFrame([feats_for_display]))
-                explain_button("cbf", "Explain CBF")
-                explain_button("cbp_score", "Explain regularity score")
-                explain_button("cbp_amp", "Explain amplitude")
-                explain_button("zcr", "Explain zero-crossing rate")
-                explain_button("var", "Explain variance")
+                explain_button("cbf_table", "Explain CBF", feature_key="cbf", mode=mode)
+                explain_button("cbp_score_table", "Explain regularity score", feature_key="cbp_score", mode=mode)
+                explain_button("cbp_amp_table", "Explain amplitude", feature_key="cbp_amp", mode=mode)
+                explain_button("zcr_table", "Explain zero-crossing rate", feature_key="zcr", mode=mode)
+                explain_button("var_table", "Explain variance", feature_key="var", mode=mode)
 
-            else:  # Researcher
-                st.markdown("### Raw feature table")
-                st.table(pd.DataFrame([feats_for_display]))
+            if healthy_baseline is not None:
+                this_video_values = []
+                for fname in healthy_baseline["feature"]:
+                    this_video_values.append(feats_for_display.get(fname, np.nan))
 
-            # Prediction
+                compare_df = healthy_baseline.copy()
+                compare_df["This video"] = this_video_values
+
+                st.markdown("### How this video compares to healthy baseline")
+
+                st.dataframe(
+                    compare_df.style.format(
+                        {
+                            "Healthy mean": "{:.3f}",
+                            "Healthy low (mean-1σ)": "{:.3f}",
+                            "Healthy high (mean+1σ)": "{:.3f}",
+                            "This video": "{:.3f}",
+                        }
+                    )
+                )
+
+                if mode == "Student":
+                    st.caption(
+                        "These values come from videos labeled Healthy in the training data. "
+                        "Healthy mean and mean ± 1σ show a typical range for normal cilia. "
+                        "The last column shows this video. This is for learning only."
+                    )
+                else:
+                    st.caption(
+                        "Baseline distributions are derived from the Healthy subset in "
+                        "labeled_cilia_video_dataset.csv as mean ± 1 SD for each feature. "
+                        "They are dataset-based references, not diagnostic thresholds."
+                    )
+
             row = [feats_for_display.get(name, np.nan) for name in feat_cols]
             X_new = pd.DataFrame([row], columns=feat_cols)
 
@@ -623,25 +619,24 @@ def main():
                 pred_prob = float(proba[class_to_idx[pred_class]])
 
             st.subheader("Model prediction")
-            explain_button("prediction", "Explain how this prediction works")
+            explain_button("prediction_btn", "Explain how this prediction works", feature_key="prediction", mode=mode)
 
             if pred_class == "Healthy":
-                msg = "Prediction: **Healthy-like cilia motion**"
+                msg = "Prediction: Healthy-like cilia motion"
                 if pred_prob is not None:
                     msg += f" (approx. confidence {pred_prob*100:.1f}%)"
                 st.success(msg)
             else:
-                msg = "Prediction: **PCD-like cilia motion**"
+                msg = "Prediction: PCD-like cilia motion"
                 if pred_prob is not None:
                     msg += f" (approx. confidence {pred_prob*100:.1f}%)"
                 st.error(msg)
 
-            # Signal plots
             raw = feats.get("raw_signal", None)
             flt = feats.get("filtered_signal", None)
             if raw is not None and flt is not None:
                 st.markdown("### Motion signal over time")
-                explain_button("signals", "Explain these plots")
+                explain_button("signals_plots", "Explain these plots", feature_key="signals", mode=mode)
                 t = np.arange(len(raw)) / float(fps)
 
                 fig_sig, ax_sig = plt.subplots()
@@ -654,7 +649,7 @@ def main():
                 st.pyplot(fig_sig)
 
                 if st.checkbox("Show FFT of filtered signal"):
-                    explain_button("fft", "Explain the FFT view")
+                    explain_button("fft_btn", "Explain the FFT view", feature_key="fft", mode=mode)
                     spec = np.abs(rfft(flt))
                     freqs = rfftfreq(len(flt), 1.0 / fps)
                     fig_fft, ax_fft = plt.subplots()
@@ -666,10 +661,26 @@ def main():
                     ax_fft.grid(True)
                     st.pyplot(fig_fft)
 
-    # ---------------- Tab: Simulation lab ----------------
     with tab_sim:
         st.header("Cilia motion simulation lab")
-        explain_button("sim_sliders", "Explain the simulation controls")
+        explain_button("sim_sliders_btn", "Explain the simulation controls", feature_key="sim_sliders", mode=mode)
+
+        st.markdown("""
+        ### What this Simulation Lab does
+
+        This section lets you explore how different ciliary motion characteristics affect the signal we measure.
+        It does not use real videos. Instead, it generates a synthetic motion pattern so you can build intuition about the features used in analysis.
+
+        You can adjust:
+
+        • CBF (Ciliary Beat Frequency): how fast the cilia beat  
+        • Regularity: how smooth or irregular the motion is  
+        • Amplitude: how strong the beating is  
+        • Duration: how long the simulated signal lasts  
+
+        The plots update instantly so you can see how each parameter shapes the signal.  
+        The toy cilium view shows a simple physical interpretation of the signal at a chosen moment.
+        """)
 
         col1, col2 = st.columns(2)
 
@@ -681,6 +692,8 @@ def main():
                 value=8.0,
                 step=0.5,
             )
+            explain_button("sim_cbf", "Explain CBF slider", feature_key="cbf", mode=mode)
+
             sim_reg = st.slider(
                 "Regularity (0 = very irregular, 1 = very smooth)",
                 min_value=0.0,
@@ -688,6 +701,8 @@ def main():
                 value=0.85,
                 step=0.05,
             )
+            explain_button("sim_reg", "Explain regularity slider", feature_key="cbp_score", mode=mode)
+
             sim_amp = st.slider(
                 "Motion amplitude",
                 min_value=0.2,
@@ -695,6 +710,8 @@ def main():
                 value=1.0,
                 step=0.1,
             )
+            explain_button("sim_amp", "Explain amplitude slider", feature_key="cbp_amp", mode=mode)
+
             sim_duration = st.slider(
                 "Simulation duration (seconds)",
                 min_value=1.0,
@@ -702,6 +719,7 @@ def main():
                 value=2.0,
                 step=0.5,
             )
+            explain_button("sim_duration", "Explain duration", feature_key="sim_sliders", mode=mode)
 
         with col2:
             st.write("Presets:")
@@ -721,8 +739,8 @@ def main():
                 sim_amp = 0.8
 
             st.write(
-                "- **Healthy-like**: higher CBF, regular beating, stronger amplitude\n"
-                "- **PCD-like**: lower CBF, irregular pattern, weaker amplitude"
+                "- Healthy-like: higher CBF, regular beating, stronger amplitude\n"
+                "- PCD-like: lower CBF, irregular pattern, weaker amplitude"
             )
 
         sim_fps = 100.0
@@ -735,6 +753,7 @@ def main():
         )
 
         st.subheader("Simulated brightness / motion signal")
+        explain_button("sim_signal", "Explain simulated signal", feature_key="signals", mode=mode)
         fig_sim, ax_sim = plt.subplots()
         ax_sim.plot(t_sim, sig_sim)
         ax_sim.set_xlabel("Time (seconds)")
@@ -743,7 +762,7 @@ def main():
         st.pyplot(fig_sim)
 
         st.subheader("Toy cilium view (single frame)")
-        explain_button("sim_cilium", "Explain this toy cilium")
+        explain_button("sim_cilium_btn", "Explain toy cilium", feature_key="sim_cilium", mode=mode)
 
         idx = st.slider(
             "Pick a time index",
@@ -759,24 +778,30 @@ def main():
         fig_cil = draw_cilium_frame(norm_val)
         st.pyplot(fig_cil)
 
-    # ---------------- Tab: Multi-cilia visualizer ----------------
-    with tab_multi:
-        st.header("Multi-cilia visualizer")
-        explain_button("multi_cilia", "Explain this visualizer")
+    with tab_chat:
+        st.header("CiliaBot: educational cilia explainer")
+        explain_button("cilia_chat", "Explain how CiliaBot works", feature_key="cilia_bot", mode=mode)
 
-        n = st.slider("Number of cilia", 5, 30, 12)
-        cbf2 = st.slider("CBF (Hz) for visualizer", 2.0, 20.0, 10.0)
+        st.caption(
+            "CiliaBot explains PCD, motile cilia, CBF, CBP and this app in simple language. "
+            "It is for education only and does not give medical advice or diagnosis."
+        )
 
-        t = np.linspace(0, 1, 200)
-        fig_multi, ax_multi = plt.subplots(figsize=(8, 5))
+        if "cilia_chat" not in st.session_state:
+            st.session_state.cilia_chat = []
 
-        for i in range(n):
-            phase = np.random.uniform(0, 2 * np.pi)
-            y = np.sin(2 * np.pi * cbf2 * t + phase)
-            ax_multi.plot(t, y + i * 2, linewidth=1)
+        for msg in st.session_state.cilia_chat:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
-        ax_multi.set_axis_off()
-        st.pyplot(fig_multi)
+        user_msg = st.chat_input("Ask CiliaBot about cilia, PCD, CBF, CBP, or this app")
+        if user_msg:
+            st.session_state.cilia_chat.append({"role": "user", "content": user_msg})
+            log_ciliabot_question(user_msg, mode)
+            with st.chat_message("assistant"):
+                reply = ask_gpt(st.session_state.cilia_chat)
+                st.markdown(reply)
+            st.session_state.cilia_chat.append({"role": "assistant", "content": reply})
 
 
 if __name__ == "__main__":
