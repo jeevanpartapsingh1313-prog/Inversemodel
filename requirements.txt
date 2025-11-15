@@ -5,3 +5,4 @@ opencv-python-headless
 scipy
 scikit-learn
 matplotlib
+openai>=1.55.0
